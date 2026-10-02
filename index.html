@@ -5,7 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>🥷 Ninja Audio Maker</title>
   
-  <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
+  <!-- 高品位ピッチ保持タイムストレッチライブラリ (SoundTouch Pure JS版) -->
+  <script src="https://cdn.jsdelivr.net/npm/soundtouchjs@0.1.30/dist/soundtouch.min.js"></script>
+  
   <style>
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -131,7 +133,7 @@
     </div>
   </div>
 
-  <button class="btn-primary" id="export-btn" disabled>FFmpeg で Ninja 音声を生成して保存</button>
+  <button class="btn-primary" id="export-btn" disabled>Ninja 音声を生成して保存 (WAV)</button>
   <div id="log">ステータス: 音声ファイルを選択してください。</div>
 
   <script>
@@ -143,9 +145,7 @@
 
     let audioCtx = null;
     let originalAudioBuffer = null;
-    let rawFileBytes = null;
     let selectedFileName = '';
-    let selectedFileExt = 'mp3';
 
     let startTime = 0;
     let endTime = 0;
@@ -155,8 +155,6 @@
     let previewStartOffset = 0;
     let playheadAnimId = null;
     let currentPlayheadPos = -1;
-
-    let ffmpeg = null;
 
     const dropzone = document.getElementById('dropzone');
     const fileInput = document.getElementById('file-input');
@@ -199,14 +197,12 @@
     async function loadFile(file) {
       const lastDot = file.name.lastIndexOf('.');
       selectedFileName = lastDot !== -1 ? file.name.substring(0, lastDot) : file.name;
-      selectedFileExt = lastDot !== -1 ? file.name.substring(lastDot + 1).toLowerCase() : 'mp3';
 
       fileLabel.textContent = `選択中: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)`;
-      logBox.textContent = '音声解析中...';
+      logBox.textContent = '音声デコード中...';
 
       if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       const arrayBuffer = await file.arrayBuffer();
-      rawFileBytes = new Uint8Array(arrayBuffer.slice(0));
 
       try {
         originalAudioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
@@ -223,7 +219,7 @@
         drawTrimmer();
         updateTimeLabels();
 
-        log(`解析完了: 全長 ${formatTime(totalDuration)}`);
+        log(`解析完了: 全長 ${formatTime(totalDuration)} / サンプルレート ${originalAudioBuffer.sampleRate}Hz`);
       } catch (err) {
         log('エラー: 音声ファイルのデコードに失敗しました。');
       }
@@ -412,35 +408,105 @@
       drawTrimmer();
     }
 
-    async function initFFmpeg() {
-      if (ffmpeg) return ffmpeg;
+    // ---------- SoundTouch による高品位タイムストレッチ (Pure JS) ----------
+    function stretchSoundTouch(inputAudioBuffer, rate) {
+      if (Math.abs(rate - 1.0) < 0.001) return inputAudioBuffer;
 
-      log('FFmpeg シングルスレッドコアをロード中...');
-      const { createFFmpeg } = FFmpeg;
+      const numChannels = inputAudioBuffer.numberOfChannels;
+      const sampleRate = inputAudioBuffer.sampleRate;
+      const numFrames = inputAudioBuffer.length;
 
-      ffmpeg = createFFmpeg({
-        log: false,
-        mainName: 'main',
-        corePath: 'https://unpkg.com/@ffmpeg/core-st@0.11.1/dist/ffmpeg-core.js'
-      });
+      // インターリーブ形式の Float32 配列を作成
+      const interleaved = new Float32Array(numFrames * numChannels);
+      for (let ch = 0; ch < numChannels; ch++) {
+        const chData = inputAudioBuffer.getChannelData(ch);
+        for (let i = 0; i < numFrames; i++) {
+          interleaved[i * numChannels + ch] = chData[i];
+        }
+      }
 
-      await ffmpeg.load();
-      log('FFmpeg の準備完了！');
-      return ffmpeg;
+      const soundTouch = new soundtouchjs.SoundTouch(sampleRate);
+      soundTouch.tempo = rate; // ピッチを変えずにテンポのみ変更
+
+      const source = {
+        extract: function (target, numFramesToExtract, position) {
+          const start = position * numChannels;
+          const end = Math.min(start + numFramesToExtract * numChannels, interleaved.length);
+          for (let i = 0; i < end - start; i++) {
+            target[i] = interleaved[start + i];
+          }
+          return Math.floor((end - start) / numChannels);
+        }
+      };
+
+      const filter = new soundtouchjs.SimpleFilter(source, soundTouch);
+      const outFrames = [];
+      const buffer = new Float32Array(2048 * numChannels);
+
+      while (true) {
+        const extracted = filter.extract(buffer, 2048);
+        if (extracted === 0) break;
+        outFrames.push(new Float32Array(buffer.subarray(0, extracted * numChannels)));
+      }
+
+      const totalExtractedFrames = outFrames.reduce((acc, cur) => acc + cur.length / numChannels, 0);
+      const outBuffer = audioCtx.createBuffer(numChannels, totalExtractedFrames, sampleRate);
+
+      for (let ch = 0; ch < numChannels; ch++) {
+        const channelData = outBuffer.getChannelData(ch);
+        let offset = 0;
+        for (let f = 0; f < outFrames.length; f++) {
+          const chunk = outFrames[f];
+          const chunkFrames = chunk.length / numChannels;
+          for (let i = 0; i < chunkFrames; i++) {
+            channelData[offset + i] = chunk[i * numChannels + ch];
+          }
+          offset += chunkFrames;
+        }
+      }
+
+      return outBuffer;
     }
 
-    // exit(0)（正常終了）をエラーと判定しない安全な実行ラッパー
-    async function safeRun(...args) {
-      try {
-        await ffmpeg.run(...args);
-      } catch (err) {
-        const msg = String(err && err.message ? err.message : err);
-        // exit(0) は Emscripten の正常終了コードなのでスキップ
-        if (msg.includes('exit(0)') || msg.includes('called exit')) {
-          return;
-        }
-        throw err;
+    // WAV エンコーダー
+    function bufferToWaveBlob(abuffer) {
+      const numOfChan = abuffer.numberOfChannels;
+      const length = abuffer.length * numOfChan * 2 + 44;
+      const out = new DataView(new ArrayBuffer(length));
+      let offset = 0;
+      let pos = 0;
+
+      function setUint16(data) { out.setUint16(pos, data, true); pos += 2; }
+      function setUint32(data) { out.setUint32(pos, data, true); pos += 4; }
+
+      setUint32(0x46464952); // "RIFF"
+      setUint32(length - 8);
+      setUint32(0x45564157); // "WAVE"
+      setUint32(0x20746d66); // "fmt "
+      setUint32(16);
+      setUint16(1);
+      setUint16(numOfChan);
+      setUint32(abuffer.sampleRate);
+      setUint32(abuffer.sampleRate * 2 * numOfChan);
+      setUint16(numOfChan * 2);
+      setUint16(16);
+      setUint32(0x61746164); // "data"
+      setUint32(length - pos - 4);
+
+      const channels = [];
+      for (let i = 0; i < numOfChan; i++) {
+        channels.push(abuffer.getChannelData(i));
       }
+
+      while (pos < length) {
+        for (let i = 0; i < numOfChan; i++) {
+          let s = Math.max(-1, Math.min(1, channels[i][offset]));
+          out.setInt16(pos, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+          pos += 2;
+        }
+        offset++;
+      }
+      return new Blob([out.buffer], { type: 'audio/wav' });
     }
 
     exportBtn.addEventListener('click', async () => {
@@ -448,78 +514,67 @@
       exportBtn.disabled = true;
 
       try {
-        await initFFmpeg();
-
         log(`トリミング範囲: ${formatTime(startTime)} 〜 ${formatTime(endTime)} (${(endTime - startTime).toFixed(1)}s)`);
 
-        const inName = `input.${selectedFileExt}`;
-        const trimmedName = 'trimmed.wav';
-        const outName = 'ninja_output.mp3';
+        const sampleRate = originalAudioBuffer.sampleRate;
+        const numChannels = originalAudioBuffer.numberOfChannels;
 
-        ffmpeg.FS('writeFile', inName, rawFileBytes);
+        const startSample = Math.floor(startTime * sampleRate);
+        const endSample = Math.floor(endTime * sampleRate);
+        const snippetLength = endSample - startSample;
 
         // 1. 指定区間を抽出
-        log('指定区間を抽出中...');
-        await safeRun(
-          '-ss', startTime.toFixed(3),
-          '-to', endTime.toFixed(3),
-          '-i', inName,
-          '-vn',
-          '-c:a', 'pcm_s16le',
-          trimmedName
-        );
-
-        // 2. 1本ずつ安全に atempo 変換
-        let concatContent = '';
-        for (let i = 0; i < SPEED_SEQUENCE.length; i++) {
-          const speed = SPEED_SEQUENCE[i];
-          const partName = `part_${i}.wav`;
-          log(`[${i + 1}/${SPEED_SEQUENCE.length}] ${speed.toFixed(1)}x 変換中 (atempo)...`);
-
-          const filterChain = `atempo=${speed.toFixed(2)},apad=pad_dur=${SILENCE_GAP_SEC}`;
-
-          await safeRun(
-            '-i', trimmedName,
-            '-filter:a', filterChain,
-            '-c:a', 'pcm_s16le',
-            partName
-          );
-
-          concatContent += `file '${partName}'\n`;
+        const snippet = audioCtx.createBuffer(numChannels, snippetLength, sampleRate);
+        for (let ch = 0; ch < numChannels; ch++) {
+          snippet.copyToChannel(originalAudioBuffer.getChannelData(ch).subarray(startSample, endSample), ch);
         }
 
-        // 3. 結合して最終 MP3 を生成
-        log('全パートを結合中...');
-        ffmpeg.FS('writeFile', 'concat.txt', new TextEncoder().encode(concatContent));
+        // 2. SoundTouch によるタイムストレッチ
+        const parts = [];
+        let totalSamples = 0;
+        const gapSamples = Math.floor(sampleRate * SILENCE_GAP_SEC);
 
-        await safeRun(
-          '-f', 'concat',
-          '-safe', '0',
-          '-i', 'concat.txt',
-          '-c:a', 'libmp3lame',
-          '-b:a', '192k',
-          outName
-        );
+        for (let i = 0; i < SPEED_SEQUENCE.length; i++) {
+          const speed = SPEED_SEQUENCE[i];
+          log(`[${i + 1}/${SPEED_SEQUENCE.length}] ${speed.toFixed(1)}x 変換中 (SoundTouch)...`);
+          await new Promise(r => setTimeout(r, 10)); // UI更新用
+
+          const stretched = stretchSoundTouch(snippet, speed);
+          parts.push(stretched);
+          totalSamples += stretched.length;
+
+          if (i < SPEED_SEQUENCE.length - 1) {
+            totalSamples += gapSamples;
+          }
+        }
+
+        // 3. 結合
+        log('全パートを結合中...');
+        const combinedBuffer = audioCtx.createBuffer(numChannels, totalSamples, sampleRate);
+
+        let currentOffset = 0;
+        for (let i = 0; i < parts.length; i++) {
+          const p = parts[i];
+          for (let ch = 0; ch < numChannels; ch++) {
+            combinedBuffer.getChannelData(ch).set(p.getChannelData(ch), currentOffset);
+          }
+          currentOffset += p.length;
+
+          if (i < parts.length - 1) {
+            currentOffset += gapSamples;
+          }
+        }
+
+        log('WAV ファイルを生成中...');
+        const wavBlob = bufferToWaveBlob(combinedBuffer);
 
         log('完了！ダウンロードを開始します。');
-        const data = ffmpeg.FS('readFile', outName);
-        const blob = new Blob([data.buffer], { type: 'audio/mp3' });
-        const url = URL.createObjectURL(blob);
+        const url = URL.createObjectURL(wavBlob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `${selectedFileName}_ninja_${formatTime(startTime).replace(':', 'm')}-${formatTime(endTime).replace(':', 'm')}.mp3`;
+        a.download = `${selectedFileName}_ninja_${formatTime(startTime).replace(':', 'm')}-${formatTime(endTime).replace(':', 'm')}.wav`;
         a.click();
         URL.revokeObjectURL(url);
-
-        try {
-          ffmpeg.FS('unlink', inName);
-          ffmpeg.FS('unlink', trimmedName);
-          ffmpeg.FS('unlink', 'concat.txt');
-          for (let i = 0; i < SPEED_SEQUENCE.length; i++) {
-            ffmpeg.FS('unlink', `part_${i}.wav`);
-          }
-          ffmpeg.FS('unlink', outName);
-        } catch(e){}
 
       } catch (err) {
         log('エラーが発生しました: ' + err.message);
