@@ -413,36 +413,20 @@
       drawTrimmer();
     }
 
-    function buildFilterComplex(speeds, gap) {
-      const parts = [];
-      const concatInputs = [];
-
-      speeds.forEach((speed, i) => {
-        const gapFilter = gap > 0 ? `,apad=pad_dur=${gap}` : '';
-        const chain = `[0:a]atempo=${speed.toFixed(2)}${gapFilter}[a${i}]`;
-        parts.push(chain);
-        concatInputs.push(`[a${i}]`);
-      });
-
-      parts.push(`${concatInputs.join('')}concat=n=${speeds.length}:v=0:a=1[out]`);
-      return parts.join(';');
-    }
-
-    // ★ シングルスレッド版コア (ST) の確実なロード
     async function initFFmpeg() {
       if (ffmpeg) return ffmpeg;
 
-      log('FFmpeg シングルスレッドコアをダウンロード中...');
+      log('FFmpeg シングルスレッドコアをロード中...');
       const { createFFmpeg } = FFmpeg;
 
       ffmpeg = createFFmpeg({
-        log: true,
+        log: false,
         mainName: 'main',
         corePath: 'https://unpkg.com/@ffmpeg/core-st@0.11.1/dist/ffmpeg-core.js'
       });
 
       await ffmpeg.load();
-      log('FFmpeg の初期化に成功しました！');
+      log('FFmpeg の準備完了！');
       return ffmpeg;
     }
 
@@ -461,6 +445,7 @@
 
         ffmpeg.FS('writeFile', inName, rawFileBytes);
 
+        // 1. 指定区間を抽出
         log('指定区間を抽出中...');
         await ffmpeg.run(
           '-ss', startTime.toFixed(3),
@@ -470,13 +455,33 @@
           trimmedName
         );
 
-        log('段階加速シーケンス [1.0, 0.6x3, 0.7...2.0x] を atempo で処理中...');
-        const filterStr = buildFilterComplex(SPEED_SEQUENCE, SILENCE_GAP_SEC);
+        // 2. 各スピードのパートを安全に1本ずつ生成（Wasmの複雑なfilter_complexエラーを回避）
+        let concatContent = '';
+        for (let i = 0; i < SPEED_SEQUENCE.length; i++) {
+          const speed = SPEED_SEQUENCE[i];
+          const partName = `part_${i}.wav`;
+          log(`[${i + 1}/${SPEED_SEQUENCE.length}] ${speed.toFixed(1)}x 変換中 (atempo)...`);
+
+          const filterChain = `atempo=${speed.toFixed(2)},apad=pad_dur=${SILENCE_GAP_SEC}`;
+
+          await ffmpeg.run(
+            '-i', trimmedName,
+            '-filter:a', filterChain,
+            partName
+          );
+
+          concatContent += `file '${partName}'\n`;
+        }
+
+        // 3. concat プロトコルで一括連結
+        log('全パートを結合中...');
+        ffmpeg.FS('writeFile', 'concat.txt', new TextEncoder().encode(concatContent));
 
         await ffmpeg.run(
-          '-i', trimmedName,
-          '-filter_complex', filterStr,
-          '-map', '[out]',
+          '-f', 'concat',
+          '-safe', '0',
+          '-i', 'concat.txt',
+          '-c:a', 'libmp3lame',
           '-b:a', '192k',
           outName
         );
@@ -491,9 +496,14 @@
         a.click();
         URL.revokeObjectURL(url);
 
+        // クリーンアップ
         try {
           ffmpeg.FS('unlink', inName);
           ffmpeg.FS('unlink', trimmedName);
+          ffmpeg.FS('unlink', 'concat.txt');
+          for (let i = 0; i < SPEED_SEQUENCE.length; i++) {
+            ffmpeg.FS('unlink', `part_${i}.wav`);
+          }
           ffmpeg.FS('unlink', outName);
         } catch(e){}
 
