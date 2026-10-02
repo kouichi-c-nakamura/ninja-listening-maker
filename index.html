@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>🥷 Ninja Audio Maker v2</title>
+  <title>🥷 Ninja Audio Maker</title>
   
   <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
   <style>
@@ -106,7 +106,7 @@
   </style>
 </head>
 <body>
-  <h1>🥷 Ninja Audio Maker <span style="font-size:12px;color:#888;">(Build v2.1)</span></h1>
+  <h1>🥷 Ninja Audio Maker</h1>
   <p class="desc">Repeats the selected clip at incrementally faster speeds [1.0x, 0.6x ×3, 0.7x...2.0x] with 0.8s silence gaps.</p>
 
   <div class="dropzone" id="dropzone">
@@ -132,7 +132,7 @@
   </div>
 
   <button class="btn-primary" id="export-btn" disabled>FFmpeg で Ninja 音声を生成して保存</button>
-  <div id="log">ステータス: Build v2.1 読み込み完了。音声ファイルを選択してください。</div>
+  <div id="log">ステータス: 音声ファイルを選択してください。</div>
 
   <script>
     const SPEED_SEQUENCE = [
@@ -429,6 +429,20 @@
       return ffmpeg;
     }
 
+    // exit(0)（正常終了）をエラーと判定しない安全な実行ラッパー
+    async function safeRun(...args) {
+      try {
+        await ffmpeg.run(...args);
+      } catch (err) {
+        const msg = String(err && err.message ? err.message : err);
+        // exit(0) は Emscripten の正常終了コードなのでスキップ
+        if (msg.includes('exit(0)') || msg.includes('called exit')) {
+          return;
+        }
+        throw err;
+      }
+    }
+
     exportBtn.addEventListener('click', async () => {
       stopPreview();
       exportBtn.disabled = true;
@@ -444,13 +458,14 @@
 
         ffmpeg.FS('writeFile', inName, rawFileBytes);
 
-        // 1. 指定区間を切り出し
+        // 1. 指定区間を抽出
         log('指定区間を抽出中...');
-        await ffmpeg.run(
+        await safeRun(
           '-ss', startTime.toFixed(3),
           '-to', endTime.toFixed(3),
           '-i', inName,
           '-vn',
+          '-c:a', 'pcm_s16le',
           trimmedName
         );
 
@@ -463,20 +478,21 @@
 
           const filterChain = `atempo=${speed.toFixed(2)},apad=pad_dur=${SILENCE_GAP_SEC}`;
 
-          await ffmpeg.run(
+          await safeRun(
             '-i', trimmedName,
             '-filter:a', filterChain,
+            '-c:a', 'pcm_s16le',
             partName
           );
 
           concatContent += `file '${partName}'\n`;
         }
 
-        // 3. concat で結合
+        // 3. 結合して最終 MP3 を生成
         log('全パートを結合中...');
         ffmpeg.FS('writeFile', 'concat.txt', new TextEncoder().encode(concatContent));
 
-        await ffmpeg.run(
+        await safeRun(
           '-f', 'concat',
           '-safe', '0',
           '-i', 'concat.txt',
