@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>🥷 Ninja Audio Maker</title>
   
-  <!-- ffmpeg.wasm v0.11.6 UMD -->
+  <!-- シングルスレッド対応の ffmpeg.wasm v0.11.6 -->
   <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
   <style>
     body {
@@ -428,14 +428,13 @@
       return parts.join(';');
     }
 
-    // ★ シングルスレッド専用コア (ST) の完全指定
+    // ★ シングルスレッド版コア (ST) の確実なロード
     async function initFFmpeg() {
       if (ffmpeg) return ffmpeg;
 
-      log('FFmpeg シングルスレッドコアをロード中...');
+      log('FFmpeg シングルスレッドコアをダウンロード中...');
       const { createFFmpeg } = FFmpeg;
 
-      // SharedArrayBuffer を一切使わない公式 ST ビルドを指定
       ffmpeg = createFFmpeg({
         log: true,
         mainName: 'main',
