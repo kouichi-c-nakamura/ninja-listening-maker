@@ -4,10 +4,6 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>🥷 Ninja Audio Maker</title>
-  
-  <!-- 高品位ピッチ保持タイムストレッチライブラリ (SoundTouch Pure JS版) -->
-  <script src="https://cdn.jsdelivr.net/npm/soundtouchjs@0.1.30/dist/soundtouch.min.js"></script>
-  
   <style>
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -408,60 +404,77 @@
       drawTrimmer();
     }
 
-    // ---------- SoundTouch による高品位タイムストレッチ (Pure JS) ----------
-    function stretchSoundTouch(inputAudioBuffer, rate) {
-      if (Math.abs(rate - 1.0) < 0.001) return inputAudioBuffer;
+    // ---------- 完全内蔵型 ピッチ保持 WSOLA タイムストレッチ エンジン ----------
+    function stretchBuffer(inputBuffer, rate) {
+      if (Math.abs(rate - 1.0) < 0.001) return inputBuffer;
 
-      const numChannels = inputAudioBuffer.numberOfChannels;
-      const sampleRate = inputAudioBuffer.sampleRate;
-      const numFrames = inputAudioBuffer.length;
+      const numChannels = inputBuffer.numberOfChannels;
+      const sampleRate = inputBuffer.sampleRate;
+      const inLength = inputBuffer.length;
 
-      // インターリーブ形式の Float32 配列を作成
-      const interleaved = new Float32Array(numFrames * numChannels);
-      for (let ch = 0; ch < numChannels; ch++) {
-        const chData = inputAudioBuffer.getChannelData(ch);
-        for (let i = 0; i < numFrames; i++) {
-          interleaved[i * numChannels + ch] = chData[i];
-        }
+      // 人の声に最適化されたフレーム窓設定 (約 50ms)
+      const windowSize = Math.floor(sampleRate * 0.050);
+      const halfWindow = Math.floor(windowSize / 2);
+      const seekRange = Math.floor(sampleRate * 0.018); // 位相整合探索幅
+      const hopIn = halfWindow;
+      const hopOut = Math.floor(halfWindow / rate);
+
+      const estimatedOutLength = Math.ceil(inLength / rate) + windowSize;
+      const outBuffer = audioCtx.createBuffer(numChannels, estimatedOutLength, sampleRate);
+
+      // Hann 窓
+      const windowFunc = new Float32Array(windowSize);
+      for (let i = 0; i < windowSize; i++) {
+        windowFunc[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (windowSize - 1)));
       }
 
-      const soundTouch = new soundtouchjs.SoundTouch(sampleRate);
-      soundTouch.tempo = rate; // ピッチを変えずにテンポのみ変更
-
-      const source = {
-        extract: function (target, numFramesToExtract, position) {
-          const start = position * numChannels;
-          const end = Math.min(start + numFramesToExtract * numChannels, interleaved.length);
-          for (let i = 0; i < end - start; i++) {
-            target[i] = interleaved[start + i];
-          }
-          return Math.floor((end - start) / numChannels);
-        }
-      };
-
-      const filter = new soundtouchjs.SimpleFilter(source, soundTouch);
-      const outFrames = [];
-      const buffer = new Float32Array(2048 * numChannels);
-
-      while (true) {
-        const extracted = filter.extract(buffer, 2048);
-        if (extracted === 0) break;
-        outFrames.push(new Float32Array(buffer.subarray(0, extracted * numChannels)));
-      }
-
-      const totalExtractedFrames = outFrames.reduce((acc, cur) => acc + cur.length / numChannels, 0);
-      const outBuffer = audioCtx.createBuffer(numChannels, totalExtractedFrames, sampleRate);
-
       for (let ch = 0; ch < numChannels; ch++) {
-        const channelData = outBuffer.getChannelData(ch);
-        let offset = 0;
-        for (let f = 0; f < outFrames.length; f++) {
-          const chunk = outFrames[f];
-          const chunkFrames = chunk.length / numChannels;
-          for (let i = 0; i < chunkFrames; i++) {
-            channelData[offset + i] = chunk[i * numChannels + ch];
+        const input = inputBuffer.getChannelData(ch);
+        const output = outBuffer.getChannelData(ch);
+        const norm = new Float32Array(estimatedOutLength);
+
+        let inPos = 0;
+        let outPos = 0;
+
+        while (inPos + windowSize + seekRange < inLength && outPos + windowSize < estimatedOutLength) {
+          // 最適な重ね合わせポイント（相互相関最大点）を探索して位相をロック
+          let bestOffset = 0;
+          let maxCorr = -Infinity;
+
+          for (let offset = -seekRange; offset <= seekRange; offset += 2) {
+            const p = inPos + offset;
+            if (p < 0 || p + halfWindow >= inLength) continue;
+
+            let corr = 0;
+            for (let i = 0; i < halfWindow; i += 4) {
+              corr += input[inPos + i] * input[p + i];
+            }
+            if (corr > maxCorr) {
+              maxCorr = corr;
+              bestOffset = offset;
+            }
           }
-          offset += chunkFrames;
+
+          const readPos = inPos + bestOffset;
+
+          // 窓関数をかけて足し合わせる
+          for (let i = 0; i < windowSize; i++) {
+            const w = windowFunc[i];
+            output[outPos + i] += input[readPos + i] * w;
+            norm[outPos + i] += w;
+          }
+
+          inPos += hopIn;
+          outPos += hopOut;
+        }
+
+        // 重なり度合いによる正規化（音割れ・振幅揺れを解消）
+        for (let i = 0; i < estimatedOutLength; i++) {
+          if (norm[i] > 1e-4) {
+            output[i] /= norm[i];
+          }
+          // クリッピング防止リミッター
+          output[i] = Math.max(-0.99, Math.min(0.99, output[i]));
         }
       }
 
@@ -529,17 +542,17 @@
           snippet.copyToChannel(originalAudioBuffer.getChannelData(ch).subarray(startSample, endSample), ch);
         }
 
-        // 2. SoundTouch によるタイムストレッチ
+        // 2. 内蔵 WSOLA によるタイムストレッチ
         const parts = [];
         let totalSamples = 0;
         const gapSamples = Math.floor(sampleRate * SILENCE_GAP_SEC);
 
         for (let i = 0; i < SPEED_SEQUENCE.length; i++) {
           const speed = SPEED_SEQUENCE[i];
-          log(`[${i + 1}/${SPEED_SEQUENCE.length}] ${speed.toFixed(1)}x 変換中 (SoundTouch)...`);
-          await new Promise(r => setTimeout(r, 10)); // UI更新用
+          log(`[${i + 1}/${SPEED_SEQUENCE.length}] ${speed.toFixed(1)}x 変換中...`);
+          await new Promise(r => setTimeout(r, 10));
 
-          const stretched = stretchSoundTouch(snippet, speed);
+          const stretched = stretchBuffer(snippet, speed);
           parts.push(stretched);
           totalSamples += stretched.length;
 
