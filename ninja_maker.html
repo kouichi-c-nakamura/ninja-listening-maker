@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>🥷 Ninja Audio Maker</title>
+  <!-- シングルスレッド版 ffmpeg.wasm -->
+  <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #121212;
+      color: #eee;
+      padding: 20px;
+      max-width: 640px;
+      margin: 0 auto;
+      user-select: none;
+    }
+    h1 { font-size: 22px; color: #00d2ff; margin-bottom: 4px; display: flex; align-items: center; gap: 8px; }
+    p.desc { font-size: 13px; color: #aaa; margin-top: 0; line-height: 1.5; }
+    
+    .dropzone {
+      border: 2px dashed #444;
+      border-radius: 8px;
+      padding: 28px 16px;
+      text-align: center;
+      cursor: pointer;
+      background: #1a1a1a;
+      transition: all 0.2s;
+    }
+    .dropzone:hover { border-color: #00d2ff; background: #222; }
+
+    .trimmer-box {
+      margin-top: 20px;
+      background: #1e1e1e;
+      border: 1px solid #333;
+      border-radius: 8px;
+      padding: 16px;
+      display: none;
+    }
+    .trim-title { font-size: 13px; font-weight: bold; color: #ddd; margin-bottom: 12px; }
+    
+    #trim-canvas {
+      width: 100%;
+      height: 52px;
+      border-radius: 6px;
+      background: #181818;
+      cursor: default;
+      display: block;
+    }
+
+    .time-labels {
+      display: flex;
+      justify-content: space-between;
+      font-size: 13px;
+      font-family: monospace;
+      color: #aaa;
+      margin-top: 10px;
+    }
+
+    .preview-btns {
+      display: flex;
+      gap: 8px;
+      margin-top: 14px;
+    }
+    .btn-secondary {
+      flex: 1;
+      background: #2a2a2a;
+      border: 1px solid #444;
+      color: #eee;
+      padding: 10px;
+      border-radius: 4px;
+      font-size: 13px;
+      cursor: pointer;
+      font-weight: 500;
+    }
+    .btn-secondary:hover { background: #383838; }
+
+    .btn-primary {
+      background: #00d2ff;
+      color: #121212;
+      border: none;
+      padding: 14px;
+      border-radius: 6px;
+      font-weight: bold;
+      cursor: pointer;
+      width: 100%;
+      font-size: 15px;
+      margin-top: 18px;
+    }
+    .btn-primary:disabled { background: #333; color: #777; cursor: not-allowed; }
+
+    #log {
+      background: #0a0a0a;
+      border: 1px solid #222;
+      padding: 12px;
+      border-radius: 6px;
+      font-family: monospace;
+      font-size: 11px;
+      height: 130px;
+      overflow-y: auto;
+      margin-top: 16px;
+      white-space: pre-wrap;
+      color: #888;
+    }
+  </style>
+</head>
+<body>
+  <h1>🥷 Ninja Audio Maker</h1>
+  <p class="desc">選択した区間をアンカー付き段階加速 [1.0, 0.6x3, 0.7...2.0x]（無音0.8秒区切り）で書き出します。</p>
+
+  <div class="dropzone" id="dropzone">
+    <span id="file-label">音声ファイルをドロップ または クリックして選択</span>
+    <input type="file" id="file-input" accept="audio/*" style="display: none;">
+  </div>
+
+  <div class="trimmer-box" id="trimmer-box">
+    <div class="trim-title">✂️ 練習区間のトリミング（左右ハンドルで範囲指定 / 試聴中は赤線が追従）</div>
+    
+    <canvas id="trim-canvas"></canvas>
+
+    <div class="time-labels">
+      <span>Start: <strong id="start-time-text" style="color:#00d2ff;">00:00.0</strong></span>
+      <span>Duration: <strong id="duration-text">0.0s</strong></span>
+      <span>End: <strong id="end-time-text" style="color:#ff00cc;">00:00.0</strong></span>
+    </div>
+
+    <div class="preview-btns">
+      <button class="btn-secondary" id="preview-btn">▶ 選択区間を試聴 (1.0x)</button>
+      <button class="btn-secondary" id="stop-btn">■ 停止</button>
+    </div>
+  </div>
+
+  <button class="btn-primary" id="export-btn" disabled>FFmpeg で Ninja 音声を生成して保存</button>
+  <div id="log">ステータス: 音声ファイルを選択してください。</div>
+
+  <script>
+    const SPEED_SEQUENCE = [
+      1.0, 0.6, 0.6, 0.6, 0.7, 0.8, 0.9, 1.0,
+      1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0
+    ];
+    const SILENCE_GAP_SEC = 0.8;
+
+    let audioCtx = null;
+    let originalAudioBuffer = null;
+    let rawFileBytes = null;
+    let selectedFileName = '';
+    let selectedFileExt = 'mp3';
+
+    let startTime = 0;
+    let endTime = 0;
+
+    let previewSource = null;
+    let previewStartTime = 0;
+    let previewStartOffset = 0;
+    let playheadAnimId = null;
+    let currentPlayheadPos = -1;
+
+    const { createFFmpeg } = FFmpeg;
+    let ffmpeg = null;
+
+    const dropzone = document.getElementById('dropzone');
+    const fileInput = document.getElementById('file-input');
+    const fileLabel = document.getElementById('file-label');
+    const trimmerBox = document.getElementById('trimmer-box');
+    const canvas = document.getElementById('trim-canvas');
+    const ctx = canvas.getContext('2d');
+    const startTimeText = document.getElementById('start-time-text');
+    const endTimeText = document.getElementById('end-time-text');
+    const durationText = document.getElementById('duration-text');
+    const previewBtn = document.getElementById('preview-btn');
+    const stopBtn = document.getElementById('stop-btn');
+    const exportBtn = document.getElementById('export-btn');
+    const logBox = document.getElementById('log');
+
+    function log(msg) {
+      logBox.textContent += '\n' + msg;
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    function formatTime(sec) {
+      const m = Math.floor(sec / 60);
+      const s = Math.floor(sec % 60);
+      const ms = Math.floor((sec % 1) * 10);
+      return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${ms}`;
+    }
+
+    dropzone.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', (e) => {
+      if (e.target.files[0]) loadFile(e.target.files[0]);
+    });
+    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.style.borderColor = '#00d2ff'; });
+    dropzone.addEventListener('dragleave', () => { dropzone.style.borderColor = '#444'; });
+    dropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropzone.style.borderColor = '#444';
+      if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+    });
+
+    async function loadFile(file) {
+      const lastDot = file.name.lastIndexOf('.');
+      selectedFileName = lastDot !== -1 ? file.name.substring(0, lastDot) : file.name;
+      selectedFileExt = lastDot !== -1 ? file.name.substring(lastDot + 1).toLowerCase() : 'mp3';
+
+      fileLabel.textContent = `選択中: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)`;
+      logBox.textContent = '音声解析中...';
+
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const arrayBuffer = await file.arrayBuffer();
+      rawFileBytes = new Uint8Array(arrayBuffer.slice(0));
+
+      try {
+        originalAudioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+        const totalDuration = originalAudioBuffer.duration;
+
+        startTime = 0;
+        endTime = totalDuration;
+        currentPlayheadPos = -1;
+
+        trimmerBox.style.display = 'block';
+        exportBtn.disabled = false;
+
+        initCanvasSize();
+        drawTrimmer();
+        updateTimeLabels();
+
+        log(`解析完了: 全長 ${formatTime(totalDuration)}`);
+      } catch (err) {
+        log('エラー: 音声ファイルのデコードに失敗しました。');
+      }
+    }
+
+    function initCanvasSize() {
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = rect.width * window.devicePixelRatio;
+      canvas.height = 52 * window.devicePixelRatio;
+    }
+
+    window.addEventListener('resize', () => {
+      if (originalAudioBuffer) {
+        initCanvasSize();
+        drawTrimmer();
+      }
+    });
+
+    let dragTarget = null;
+    let dragStartX = 0;
+    let initialStart = 0;
+    let initialEnd = 0;
+
+    function drawTrimmer() {
+      if (!originalAudioBuffer) return;
+      const w = canvas.width;
+      const h = canvas.height;
+      const total = originalAudioBuffer.duration;
+
+      ctx.clearRect(0, 0, w, h);
+
+      ctx.fillStyle = '#1c1c1c';
+      ctx.fillRect(0, 0, w, h);
+
+      const x1 = (startTime / total) * w;
+      const x2 = (endTime / total) * w;
+
+      ctx.fillStyle = 'rgba(0, 210, 255, 0.2)';
+      ctx.fillRect(x1, 0, x2 - x1, h);
+
+      ctx.fillStyle = '#00d2ff';
+      ctx.fillRect(x1, 0, x2 - x1, 2 * window.devicePixelRatio);
+      ctx.fillRect(x1, h - 2 * window.devicePixelRatio, x2 - x1, 2 * window.devicePixelRatio);
+
+      ctx.fillStyle = '#00d2ff';
+      ctx.fillRect(x1 - 4 * window.devicePixelRatio, 0, 8 * window.devicePixelRatio, h);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(x1 - 1 * window.devicePixelRatio, h * 0.3, 2 * window.devicePixelRatio, h * 0.4);
+
+      ctx.fillStyle = '#ff00cc';
+      ctx.fillRect(x2 - 4 * window.devicePixelRatio, 0, 8 * window.devicePixelRatio, h);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(x2 - 1 * window.devicePixelRatio, h * 0.3, 2 * window.devicePixelRatio, h * 0.4);
+
+      if (currentPlayheadPos >= 0) {
+        const px = (currentPlayheadPos / total) * w;
+        ctx.fillStyle = '#ff3344';
+        ctx.fillRect(px - 1.5 * window.devicePixelRatio, 0, 3 * window.devicePixelRatio, h);
+      }
+    }
+
+    function updateTimeLabels() {
+      startTimeText.textContent = formatTime(startTime);
+      endTimeText.textContent = formatTime(endTime);
+      durationText.textContent = `${(endTime - startTime).toFixed(1)}s`;
+    }
+
+    function getCanvasPos(e) {
+      const rect = canvas.getBoundingClientRect();
+      const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+      return (clientX - rect.left) / rect.width;
+    }
+
+    function handleMouseDown(e) {
+      if (!originalAudioBuffer) return;
+      const pos = getCanvasPos(e);
+      const total = originalAudioBuffer.duration;
+      const currentX = pos * total;
+
+      const threshold = (14 / canvas.getBoundingClientRect().width) * total;
+
+      if (Math.abs(currentX - startTime) <= threshold) {
+        dragTarget = 'start';
+      } else if (Math.abs(currentX - endTime) <= threshold) {
+        dragTarget = 'end';
+      } else if (currentX > startTime && currentX < endTime) {
+        dragTarget = 'bar';
+        dragStartX = currentX;
+        initialStart = startTime;
+        initialEnd = endTime;
+      }
+    }
+
+    function handleMouseMove(e) {
+      if (!originalAudioBuffer) return;
+      const pos = getCanvasPos(e);
+      const total = originalAudioBuffer.duration;
+      const currentX = Math.max(0, Math.min(total, pos * total));
+
+      if (!dragTarget) {
+        const threshold = (14 / canvas.getBoundingClientRect().width) * total;
+        if (Math.abs(currentX - startTime) <= threshold || Math.abs(currentX - endTime) <= threshold) {
+          canvas.style.cursor = 'ew-resize';
+        } else if (currentX > startTime && currentX < endTime) {
+          canvas.style.cursor = 'grab';
+        } else {
+          canvas.style.cursor = 'default';
+        }
+        return;
+      }
+
+      if (dragTarget === 'start') {
+        startTime = Math.min(currentX, endTime - 0.2);
+      } else if (dragTarget === 'end') {
+        endTime = Math.max(currentX, startTime + 0.2);
+      } else if (dragTarget === 'bar') {
+        const delta = currentX - dragStartX;
+        const len = initialEnd - initialStart;
+        let newStart = initialStart + delta;
+        let newEnd = initialEnd + delta;
+
+        if (newStart < 0) {
+          newStart = 0;
+          newEnd = len;
+        } else if (newEnd > total) {
+          newEnd = total;
+          newStart = total - len;
+        }
+        startTime = newStart;
+        endTime = newEnd;
+      }
+
+      drawTrimmer();
+      updateTimeLabels();
+    }
+
+    function handleMouseUp() {
+      dragTarget = null;
+    }
+
+    canvas.addEventListener('mousedown', handleMouseDown);
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    canvas.addEventListener('touchstart', handleMouseDown);
+    window.addEventListener('touchmove', handleMouseMove);
+    window.addEventListener('touchend', handleMouseUp);
+
+    previewBtn.addEventListener('click', () => {
+      stopPreview();
+      previewSource = audioCtx.createBufferSource();
+      previewSource.buffer = originalAudioBuffer;
+      previewSource.connect(audioCtx.destination);
+
+      previewStartTime = audioCtx.currentTime;
+      previewStartOffset = startTime;
+      currentPlayheadPos = startTime;
+
+      previewSource.start(0, startTime, endTime - startTime);
+      previewSource.onended = () => stopPreview();
+
+      function updatePlayhead() {
+        const elapsed = audioCtx.currentTime - previewStartTime;
+        currentPlayheadPos = previewStartOffset + elapsed;
+        if (currentPlayheadPos >= endTime) {
+          stopPreview();
+          return;
+        }
+        drawTrimmer();
+        playheadAnimId = requestAnimationFrame(updatePlayhead);
+      }
+      playheadAnimId = requestAnimationFrame(updatePlayhead);
+    });
+
+    stopBtn.addEventListener('click', stopPreview);
+
+    function stopPreview() {
+      if (previewSource) {
+        try { previewSource.stop(); } catch(e){}
+        previewSource = null;
+      }
+      if (playheadAnimId) {
+        cancelAnimationFrame(playheadAnimId);
+        playheadAnimId = null;
+      }
+      currentPlayheadPos = -1;
+      drawTrimmer();
+    }
+
+    function buildFilterComplex(speeds, gap) {
+      const parts = [];
+      const concatInputs = [];
+
+      speeds.forEach((speed, i) => {
+        const gapFilter = gap > 0 ? `,apad=pad_dur=${gap}` : '';
+        const chain = `[0:a]atempo=${speed.toFixed(2)}${gapFilter}[a${i}]`;
+        parts.push(chain);
+        concatInputs.push(`[a${i}]`);
+      });
+
+      parts.push(`${concatInputs.join('')}concat=n=${speeds.length}:v=0:a=1[out]`);
+      return parts.join(';');
+    }
+
+    exportBtn.addEventListener('click', async () => {
+      stopPreview();
+      exportBtn.disabled = true;
+
+      if (!ffmpeg) {
+        log('FFmpeg を準備中 (初回のみダウンロードされます)...');
+        ffmpeg = createFFmpeg({
+          log: false,
+          corePath: 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js'
+        });
+        await ffmpeg.load();
+        log('FFmpeg 準備完了。');
+      }
+
+      try {
+        log(`トリミング範囲: ${formatTime(startTime)} 〜 ${formatTime(endTime)} (${(endTime - startTime).toFixed(1)}s)`);
+
+        const inName = `input.${selectedFileExt}`;
+        const trimmedName = 'trimmed.wav';
+        const outName = 'ninja_output.mp3';
+
+        ffmpeg.FS('writeFile', inName, rawFileBytes);
+
+        log('指定区間を抽出中...');
+        await ffmpeg.run(
+          '-ss', startTime.toFixed(3),
+          '-to', endTime.toFixed(3),
+          '-i', inName,
+          '-vn',
+          trimmedName
+        );
+
+        log('段階加速シーケンス [1.0, 0.6x3, 0.7...2.0x] を生成中 (atempo)...');
+        const filterStr = buildFilterComplex(SPEED_SEQUENCE, SILENCE_GAP_SEC);
+
+        await ffmpeg.run(
+          '-i', trimmedName,
+          '-filter_complex', filterStr,
+          '-map', '[out]',
+          '-b:a', '192k',
+          outName
+        );
+
+        log('エンコード完了！ダウンロードを開始します。');
+        const data = ffmpeg.FS('readFile', outName);
+        const blob = new Blob([data.buffer], { type: 'audio/mp3' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${selectedFileName}_ninja_${formatTime(startTime).replace(':', 'm')}-${formatTime(endTime).replace(':', 'm')}.mp3`;
+        a.click();
+        URL.revokeObjectURL(url);
+
+        ffmpeg.FS('unlink', inName);
+        ffmpeg.FS('unlink', trimmedName);
+        ffmpeg.FS('unlink', outName);
+      } catch (err) {
+        log('エラーが発生しました: ' + err.message);
+      } finally {
+        exportBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
