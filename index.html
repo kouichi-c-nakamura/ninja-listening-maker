@@ -3,9 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>🥷 Ninja Audio Maker</title>
+  <title>🥷 Ninja Audio Maker v2</title>
   
-  <!-- シングルスレッド対応の ffmpeg.wasm v0.11.6 -->
   <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
   <style>
     body {
@@ -107,7 +106,7 @@
   </style>
 </head>
 <body>
-  <h1>🥷 Ninja Audio Maker</h1>
+  <h1>🥷 Ninja Audio Maker <span style="font-size:12px;color:#888;">(Build v2.1)</span></h1>
   <p class="desc">Repeats the selected clip at incrementally faster speeds [1.0x, 0.6x ×3, 0.7x...2.0x] with 0.8s silence gaps.</p>
 
   <div class="dropzone" id="dropzone">
@@ -133,7 +132,7 @@
   </div>
 
   <button class="btn-primary" id="export-btn" disabled>FFmpeg で Ninja 音声を生成して保存</button>
-  <div id="log">ステータス: 音声ファイルを選択してください。</div>
+  <div id="log">ステータス: Build v2.1 読み込み完了。音声ファイルを選択してください。</div>
 
   <script>
     const SPEED_SEQUENCE = [
@@ -445,7 +444,7 @@
 
         ffmpeg.FS('writeFile', inName, rawFileBytes);
 
-        // 1. 指定区間を抽出
+        // 1. 指定区間を切り出し
         log('指定区間を抽出中...');
         await ffmpeg.run(
           '-ss', startTime.toFixed(3),
@@ -455,7 +454,7 @@
           trimmedName
         );
 
-        // 2. 各スピードのパートを安全に1本ずつ生成（Wasmの複雑なfilter_complexエラーを回避）
+        // 2. 1本ずつ安全に atempo 変換
         let concatContent = '';
         for (let i = 0; i < SPEED_SEQUENCE.length; i++) {
           const speed = SPEED_SEQUENCE[i];
@@ -473,7 +472,7 @@
           concatContent += `file '${partName}'\n`;
         }
 
-        // 3. concat プロトコルで一括連結
+        // 3. concat で結合
         log('全パートを結合中...');
         ffmpeg.FS('writeFile', 'concat.txt', new TextEncoder().encode(concatContent));
 
@@ -496,7 +495,6 @@
         a.click();
         URL.revokeObjectURL(url);
 
-        // クリーンアップ
         try {
           ffmpeg.FS('unlink', inName);
           ffmpeg.FS('unlink', trimmedName);
